@@ -563,6 +563,134 @@ end # VERSION >= v"1.12"
     end
 end
 
+@static if VERSION >= v"1.11-"
+    # A phi of `julia.gc_loaded` values whose data pointers cannot be walked back to the
+    # memory they point into, as when they were cached for the reverse pass: each is taken
+    # relative to its memory's own data pointer. A data pointer loaded from the memory's
+    # data field still needs no offset.
+    @testset "nodecayed_phis! gc_loaded of a cached data pointer" begin
+        # Typed-pointer IR, which parses to opaque pointers too; the checks match either spelling.
+        @test @filecheck begin
+            @check_label "@cached"
+            @check "sub nuw i64"
+            @check "sub nuw i64"
+            @check "phi {{.*}}addrspace(10){{.*}} [ %m1, %a ], [ %m2, %b ]"
+            @check "phi i64"
+            @check "@julia.gc_loaded{{.*}} %nodecayed.d"
+            @check "getelementptr i8, {{.*}}addrspace(13)"
+            @check_label "@mixed"
+            @check "sub nuw i64"
+            @check "phi {{.*}}addrspace(10){{.*}} [ %mem, %a ], [ %m2, %b ]"
+            @check "phi i64 [ 0, %a ]"
+            LLVM.Context() do ctx
+                mod = parse(
+                    LLVM.Module, """
+                    source_filename = "start"
+                    target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12:13"
+                    target triple = "x86_64-linux-gnu"
+
+                    declare {} addrspace(13)* @julia.gc_loaded({} addrspace(10)*, {}*)
+
+                    define double @cached(i1 %c, { {} addrspace(10)*, {}* } %t1, { {} addrspace(10)*, {}* } %t2) #0 {
+                    top:
+                      br i1 %c, label %a, label %b
+
+                    a:
+                      %m1 = extractvalue { {} addrspace(10)*, {}* } %t1, 0
+                      %p1 = extractvalue { {} addrspace(10)*, {}* } %t1, 1
+                      %d1 = call {} addrspace(13)* @julia.gc_loaded({} addrspace(10)* %m1, {}* %p1)
+                      br label %merge
+
+                    b:
+                      %m2 = extractvalue { {} addrspace(10)*, {}* } %t2, 0
+                      %p2 = extractvalue { {} addrspace(10)*, {}* } %t2, 1
+                      %d2 = call {} addrspace(13)* @julia.gc_loaded({} addrspace(10)* %m2, {}* %p2)
+                      br label %merge
+
+                    merge:
+                      %d = phi {} addrspace(13)* [ %d1, %a ], [ %d2, %b ]
+                      %dd = bitcast {} addrspace(13)* %d to double addrspace(13)*
+                      %x = load double, double addrspace(13)* %dd, align 8
+                      ret double %x
+                    }
+
+                    define double @mixed(i1 %c, {} addrspace(10)* %mem, { {} addrspace(10)*, {}* } %t) #0 {
+                    top:
+                      br i1 %c, label %a, label %b
+
+                    a:
+                      %mc = addrspacecast {} addrspace(10)* %mem to {} addrspace(11)*
+                      %mcs = bitcast {} addrspace(11)* %mc to { i64, {}* } addrspace(11)*
+                      %f = getelementptr inbounds { i64, {}* }, { i64, {}* } addrspace(11)* %mcs, i64 0, i32 1
+                      %p1 = load {}*, {}* addrspace(11)* %f, align 8
+                      %d1 = call {} addrspace(13)* @julia.gc_loaded({} addrspace(10)* %mem, {}* %p1)
+                      br label %merge
+
+                    b:
+                      %m2 = extractvalue { {} addrspace(10)*, {}* } %t, 0
+                      %p2 = extractvalue { {} addrspace(10)*, {}* } %t, 1
+                      %d2 = call {} addrspace(13)* @julia.gc_loaded({} addrspace(10)* %m2, {}* %p2)
+                      br label %merge
+
+                    merge:
+                      %d = phi {} addrspace(13)* [ %d1, %a ], [ %d2, %b ]
+                      %dd = bitcast {} addrspace(13)* %d to double addrspace(13)*
+                      %x = load double, double addrspace(13)* %dd, align 8
+                      ret double %x
+                    }
+
+                    attributes #0 = { "enzymejl_world"="1" }
+                    """
+                )
+
+                Enzyme.Compiler.nodecayed_phis!(mod)
+                string(mod)
+            end
+        end
+    end
+
+    # https://github.com/EnzymeAD/Enzyme.jl/issues/3329: such a phi, reached by forward over reverse through a loop
+    # over a copied `Vector`, made `nodecayed_phis!` throw "Could not analyze garbage collection behavior" on Julia 1.11.
+    struct Problem3329
+        f::Any
+        jac::Any
+        u0::Vector{Float64}
+        p::Vector{Float64}
+    end
+    @noinline function solve3329(prob::Problem3329)
+        u = copy(prob.u0)
+        p = prob.p
+        f = prob.f
+        jac = prob.jac
+        for _ in 1:2
+            k1 = f(u[1], p[1])
+            u[1] += 0.1 * k1
+            jval = if jac !== nothing
+                Base.invokelatest(jac, u[1], p[1])::Float64
+            else
+                0.0
+            end
+            u[1] += 0.01 * jval
+        end
+        return u[1]
+    end
+    function loss3329(p)
+        f = (x, pval) -> -pval * x
+        y = solve3329(Problem3329(f, nothing, [1.0], p))
+        return y * y
+    end
+    @noinline function grad3329(p)
+        dp = zero(p)
+        autodiff(set_runtime_activity(Reverse), Const(loss3329), Active, Duplicated(p, dp))
+        return dp
+    end
+
+    @testset "nodecayed_phis! from forward over reverse through a loop (#3329)" begin
+        @test grad3329([0.5]) ≈ [-0.34295]
+        @test autodiff(set_runtime_activity(Forward), Const(p -> sum(grad3329(p))), Duplicated([0.5], [1.0]))[1] ≈ 0.1083
+    end
+end
+
 
 # --- fix_decayaddr! -----------------------------------------------------------
 
